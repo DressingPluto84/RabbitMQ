@@ -1,6 +1,9 @@
 # Compiled broker binary
 /broker
 
+# Test client binary
+/test/brokertest
+
 # Go build/test artifacts
 *.exe
 *.out
