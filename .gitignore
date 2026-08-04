@@ -1,0 +1,7 @@
+# Compiled broker binary
+/broker
+
+# Go build/test artifacts
+*.exe
+*.out
+*.test
