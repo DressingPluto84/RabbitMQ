@@ -47,3 +47,17 @@ func addQueue(reg *registry, name string) *queue {
 
 	return q 
 }
+
+func addMessage(reg *registry, name string, m message) {
+	reg.mu.Lock()
+	q := reg.queues[name]
+	reg.mu.Unlock()
+	if q == nil {
+		return
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.messages = append(q.messages, m)
+}

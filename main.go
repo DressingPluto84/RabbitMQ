@@ -11,6 +11,8 @@ import (
 // Wire constants.
 const (
 	frameMethod 			= 1    // METHOD frame type (§4.2.3)
+	frameHeader				= 2    // content HEADER frame type (§4.2.3)
+	frameBody				= 3    // content BODY frame type (§4.2.3)
 	frameEnd    			= 0xCE // mandatory frame terminator (§4.2.3)
 
 	classConnection 		= 10   // connection class-id
@@ -34,6 +36,12 @@ const (
 	methodQueueUnbindOk		= 51   // queue.unbind-ok
 	methodQueueDelete		= 40   // queue.delete
 	methodQueueDeleteOk		= 41   // queue.delete.ok
+
+	classBasic				= 60   // basic class-id
+	methodBasicConsume		= 20   // basic.consume
+	methodBasicConsumeOk	= 21   // basic.consume-ok
+	methodBasicPublish		= 40   // basic.publish
+	methodBasicDeliver		= 60   // basic.deliver
 
 	channel_max 			= 0    // max num channels on a connection
 	frame_size 				= 4096 // max bytes between frames
@@ -191,6 +199,20 @@ func handleConn(conn net.Conn) {
 			}
 			log.Printf("queue %s opened", q)
 
+		case classID == classBasic && methodID == methodBasicPublish:
+			q, err := addMessageQueue(conn, payload)
+			if err != nil {
+				log.Printf("basic.publish: %v", err)
+				return
+			}
+			log.Printf("message published to queue %q", q)
+
+		case classID == classBasic && methodID == methodBasicConsume:
+			if err := handleBasicConsume(conn, ch, payload); err != nil {
+				log.Printf("basic.consume: %v", err)
+				return
+			}
+
 		default:
 			log.Printf("unhandled method %d/%d on channel %d", classID, methodID, ch)
 		}
@@ -258,4 +280,27 @@ func sendQueueDeclareOk(conn net.Conn, channel uint16, payload []byte) (string, 
 
 	payload = methodPayload(classQueue, methodQueueDeclareOk, args.Bytes())
 	return name, writeFrame(conn, frameMethod, channel, payload)
+}
+
+func addMessageQueue(conn net.Conn, payload []byte) (string, error) {
+	// method header
+	_, off := readShortStr(payload, 6)
+	routingKey, _ := readShortStr(payload, off)
+
+	// payload header and body
+	_, _, _, err := readFrame(conn)
+	if err != nil {
+		return "", err
+	}
+	_, _, body, err := readFrame(conn)
+	if err != nil {
+		return "", err
+	}
+
+	m := message{
+		payload: body,
+		routingKey: routingKey,
+	}
+	addMessage(reg, routingKey, m)
+	return routingKey, nil
 }
