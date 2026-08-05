@@ -40,6 +40,9 @@ const (
 	heartbeat				= 0    // how many seconds between heartbeat calls
 )
 
+// queue registry
+var reg = &registry{queues: make(map[string]*queue)}
+
 // The 8-byte header a client must send first: "AMQP" 0 0 9 1. (§4.2.2)
 var protocolHeader = []byte{'A', 'M', 'Q', 'P', 0, 0, 9, 1}
 
@@ -245,6 +248,8 @@ func sendChannelOpenOk(conn net.Conn, channel uint16) error {
 
 func sendQueueDeclareOk(conn net.Conn, channel uint16, payload []byte) (string, error) {
 	name, _ := readShortStr(payload, 6) // 2 bytes each for class type and method, 2 bytes for reserved short
+
+	addQueue(reg, name)
 	
 	args := new(bytes.Buffer)
 	writeShortStr(args, name) // write q name
