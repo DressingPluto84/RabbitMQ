@@ -10,20 +10,34 @@ import (
 
 // Wire constants.
 const (
-	frameMethod 	= 1    // METHOD frame type (§4.2.3)
-	frameEnd    	= 0xCE // mandatory frame terminator (§4.2.3)
+	frameMethod 			= 1    // METHOD frame type (§4.2.3)
+	frameEnd    			= 0xCE // mandatory frame terminator (§4.2.3)
 
-	classConnection = 10   // connection class-id
-	methodStart     = 10   // connection.start method-id
-	methodStartOk   = 11   // connection.start-ok method-id
-	methodTune 		= 30   // connection.tune
-	methodTuneOk    = 31   // connection.tune-ok
-	methodOpen      = 40   // connection.open
-	methodOpenOk    = 41   // connection.open-ok 
+	classConnection 		= 10   // connection class-id
+	methodStart     		= 10   // connection.start method-id
+	methodStartOk   		= 11   // connection.start-ok method-id
+	methodTune 				= 30   // connection.tune
+	methodTuneOk    		= 31   // connection.tune-ok
+	methodOpen      		= 40   // connection.open
+	methodOpenOk    		= 41   // connection.open-ok 
 
-	channel_max 	= 0    // max num channels on a connection
-	frame_size 		= 4096 // max bytes between frames
-	heartbeat		= 0    // how many seconds between heartbeat calls
+	classChannel        	= 20   // channel class-id
+	methodChannelOpen   	= 10   // channel.open
+	methodChannelOpenOk 	= 11   // channel.open-ok
+
+	classQueue 				= 50   // queue class-id
+	methodQueueDeclare  	= 10   // queue.declare 
+	methodQueueDeclareOk 	= 11   // queue.declare-ok
+	methodQueueBind			= 20   // queue.bind
+	methodQueueBindOk		= 21   // queue.bind-ok
+	methodQueueUnbind		= 50   // queue.unbind
+	methodQueueUnbindOk		= 51   // queue.unbind-ok
+	methodQueueDelete		= 40   // queue.delete
+	methodQueueDeleteOk		= 41   // queue.delete.ok
+
+	channel_max 			= 0    // max num channels on a connection
+	frame_size 				= 4096 // max bytes between frames
+	heartbeat				= 0    // how many seconds between heartbeat calls
 )
 
 // The 8-byte header a client must send first: "AMQP" 0 0 9 1. (§4.2.2)
@@ -136,6 +150,48 @@ func handleConn(conn net.Conn) {
 		return
 	}
 	log.Printf("sent connection.open-ok")
+
+	// Handshake done — the connection is open. From here it's no longer a fixed
+	// script: the client sends frames whenever it wants, so we loop, read each
+	// frame, and dispatch by class/method. This loop IS the connection state
+	// machine.
+	for {
+		frameType, ch, payload, err := readFrame(conn)
+		if err != nil {
+			log.Printf("read frame: %v", err)
+			return
+		}
+		// Only METHOD frames carry a class/method. Header/body/heartbeat frames
+		// are handled elsewhere (or ignored for now); skip them here so we don't
+		// index into a payload that has no class/method.
+		if frameType != frameMethod || len(payload) < 4 {
+			continue
+		}
+		classID := binary.BigEndian.Uint16(payload[0:2])
+		methodID := binary.BigEndian.Uint16(payload[2:4])
+
+		switch {
+		case classID == classChannel && methodID == methodChannelOpen:
+			// Client opened a channel (conn.Channel()). Reply on the SAME
+			// channel number the client chose — not 0.
+			if err := sendChannelOpenOk(conn, ch); err != nil {
+				log.Printf("send channel.open-ok: %v", err)
+				return
+			}
+			log.Printf("channel %d opened", ch)
+
+		case classID == classQueue && methodID == methodQueueDeclare:
+			q, err := sendQueueDeclareOk(conn, ch, payload)
+			if err != nil {
+				log.Printf("send queue.declare: %v", err)
+				return
+			}
+			log.Printf("queue %s opened", q)
+
+		default:
+			log.Printf("unhandled method %d/%d on channel %d", classID, methodID, ch)
+		}
+	}
 }
 
 // sendConnectionStart builds and writes the connection.start method.
@@ -174,4 +230,27 @@ func sendConnectionOpenOk(conn net.Conn) error {
 
 	payload := methodPayload(classConnection, methodOpenOk, args.Bytes())
 	return writeFrame(conn, frameMethod, 0, payload)
+}
+
+// sendChannelOpenOk replies to a channel.open. Unlike the connection methods,
+// this goes back on the client's channel number, not 0. Its one field
+// (reserved-1) is a longstr, so we write an empty longstr (4 zero bytes).
+func sendChannelOpenOk(conn net.Conn, channel uint16) error {
+	args := new(bytes.Buffer)
+	writeLongStr(args, "") // reserved-1
+
+	payload := methodPayload(classChannel, methodChannelOpenOk, args.Bytes())
+	return writeFrame(conn, frameMethod, channel, payload)
+}
+
+func sendQueueDeclareOk(conn net.Conn, channel uint16, payload []byte) (string, error) {
+	name, _ := readShortStr(payload, 6) // 2 bytes each for class type and method, 2 bytes for reserved short
+	
+	args := new(bytes.Buffer)
+	writeShortStr(args, name) // write q name
+	binary.Write(args, binary.BigEndian, uint32(0)) // message-count
+	binary.Write(args, binary.BigEndian, uint32(0)) // consumer-count
+
+	payload = methodPayload(classQueue, methodQueueDeclareOk, args.Bytes())
+	return name, writeFrame(conn, frameMethod, channel, payload)
 }

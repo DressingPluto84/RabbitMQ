@@ -17,6 +17,11 @@ func writeShortStr(buf *bytes.Buffer, s string) {
 	buf.WriteString(s)
 }
 
+func readShortStr(frame []byte, offset int) (string, int) {
+	length := frame[offset]
+	return string(frame[offset + 1:offset + int(length) + 1]), offset + int(length) + 1
+}
+
 // writeLongStr: 4-byte length + bytes. (§4.2.5.3)
 func writeLongStr(buf *bytes.Buffer, s string) {
 	binary.Write(buf, binary.BigEndian, uint32(len(s)))
