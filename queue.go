@@ -10,10 +10,15 @@ type message struct {
 	routingKey string
 }
 
+type connection struct {
+	conn net.Conn
+	mu sync.Mutex
+}
+
 type consumer struct {
 	tag string // tag into the channel in case of multi consumer
 	ch uint16
-	conn net.Conn
+	c *connection
 }
 
 type queue struct {
@@ -60,4 +65,10 @@ func addMessage(reg *registry, name string, m message) {
 	defer q.mu.Unlock()
 
 	q.messages = append(q.messages, m)
+}
+
+func (c *connection) writeFrame(frameType byte, channel uint16, payload []byte) error {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    return writeFrame(c.conn, frameType, channel, payload) // unprotected until we added this func
 }

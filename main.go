@@ -74,6 +74,9 @@ func main() {
 // handleConn drives the connection state machine. Right now it covers the first
 // two handshake steps: validate the protocol header, then send connection.start.
 func handleConn(conn net.Conn) {
+	c := &connection{
+		conn: conn,
+	}
 	defer conn.Close()
 	log.Printf("client connected: %s", conn.RemoteAddr())
 
@@ -92,7 +95,7 @@ func handleConn(conn net.Conn) {
 	log.Printf("valid protocol header received")
 
 	// Step 2 — send connection.start (§2.2.4).
-	if err := sendConnectionStart(conn); err != nil {
+	if err := sendConnectionStart(c); err != nil {
 		log.Printf("send connection.start: %v", err)
 		return
 	}
@@ -115,7 +118,7 @@ func handleConn(conn net.Conn) {
 	log.Printf("received connection.start-ok")
 
 	// Step 4 — send connection.tune.
-	if err := sendConnectionTune(conn); err != nil {
+	if err := sendConnectionTune(c); err != nil {
 		log.Printf("tune connection failed: %v", err)
 		return
 	}
@@ -156,7 +159,7 @@ func handleConn(conn net.Conn) {
 	// Step 7 — send connection.open-ok (class 10, method 41).
 	// One field: reserved-1 (shortstr) — send an empty short string.
 	// After this, amqp.Dial returns.
-	if err := sendConnectionOpenOk(conn); err != nil {
+	if err := sendConnectionOpenOk(c); err != nil {
 		log.Printf("open-ok connection failed: %v", err)
 		return
 	}
@@ -185,14 +188,14 @@ func handleConn(conn net.Conn) {
 		case classID == classChannel && methodID == methodChannelOpen:
 			// Client opened a channel (conn.Channel()). Reply on the SAME
 			// channel number the client chose — not 0.
-			if err := sendChannelOpenOk(conn, ch); err != nil {
+			if err := sendChannelOpenOk(c, ch); err != nil {
 				log.Printf("send channel.open-ok: %v", err)
 				return
 			}
 			log.Printf("channel %d opened", ch)
 
 		case classID == classQueue && methodID == methodQueueDeclare:
-			q, err := sendQueueDeclareOk(conn, ch, payload)
+			q, err := sendQueueDeclareOk(c, ch, payload)
 			if err != nil {
 				log.Printf("send queue.declare: %v", err)
 				return
@@ -200,7 +203,7 @@ func handleConn(conn net.Conn) {
 			log.Printf("queue %s opened", q)
 
 		case classID == classBasic && methodID == methodBasicPublish:
-			q, err := addMessageQueue(conn, payload)
+			q, err := addMessageQueue(c, payload)
 			if err != nil {
 				log.Printf("basic.publish: %v", err)
 				return
@@ -208,7 +211,7 @@ func handleConn(conn net.Conn) {
 			log.Printf("message published to queue %q", q)
 
 		case classID == classBasic && methodID == methodBasicConsume:
-			if err := handleBasicConsume(conn, ch, payload); err != nil {
+			if err := handleBasicConsume(c, ch, payload); err != nil {
 				log.Printf("basic.consume: %v", err)
 				return
 			}
@@ -227,7 +230,7 @@ func handleConn(conn net.Conn) {
 //	server-properties peer-properties   -> {} (empty for now)
 //	mechanisms        longstr           -> "PLAIN"
 //	locales           longstr           -> "en_US"
-func sendConnectionStart(conn net.Conn) error {
+func sendConnectionStart(c *connection) error {
 	args := new(bytes.Buffer)
 	args.WriteByte(0)            // version-major
 	args.WriteByte(9)            // version-minor
@@ -236,63 +239,63 @@ func sendConnectionStart(conn net.Conn) error {
 	writeLongStr(args, "en_US")  // locales
 
 	payload := methodPayload(classConnection, methodStart, args.Bytes())
-	return writeFrame(conn, frameMethod, 0, payload) // channel 0 = connection-level
+	return c.writeFrame(frameMethod, 0, payload) // channel 0 = connection-level
 }
 
-func sendConnectionTune(conn net.Conn) error {
+func sendConnectionTune(c *connection) error {
 	args := new(bytes.Buffer)
 	binary.Write(args, binary.BigEndian, uint16(channel_max))
 	binary.Write(args, binary.BigEndian, uint32(frame_size))
 	binary.Write(args, binary.BigEndian, uint16(heartbeat))
 
 	payload := methodPayload(classConnection, methodTune, args.Bytes())
-	return writeFrame(conn, frameMethod, 0, payload)
+	return c.writeFrame(frameMethod, 0, payload)
 }
 
-func sendConnectionOpenOk(conn net.Conn) error {
+func sendConnectionOpenOk(conn *connection) error {
 	args := new(bytes.Buffer)
 	binary.Write(args, binary.BigEndian, byte(0))
 
 	payload := methodPayload(classConnection, methodOpenOk, args.Bytes())
-	return writeFrame(conn, frameMethod, 0, payload)
+	return conn.writeFrame(frameMethod, 0, payload)
 }
 
 // sendChannelOpenOk replies to a channel.open. Unlike the connection methods,
 // this goes back on the client's channel number, not 0. Its one field
 // (reserved-1) is a longstr, so we write an empty longstr (4 zero bytes).
-func sendChannelOpenOk(conn net.Conn, channel uint16) error {
+func sendChannelOpenOk(c *connection, channel uint16) error {
 	args := new(bytes.Buffer)
 	writeLongStr(args, "") // reserved-1
 
 	payload := methodPayload(classChannel, methodChannelOpenOk, args.Bytes())
-	return writeFrame(conn, frameMethod, channel, payload)
+	return c.writeFrame(frameMethod, channel, payload)
 }
 
-func sendQueueDeclareOk(conn net.Conn, channel uint16, payload []byte) (string, error) {
+func sendQueueDeclareOk(c *connection, channel uint16, payload []byte) (string, error) {
 	name, _ := readShortStr(payload, 6) // 2 bytes each for class type and method, 2 bytes for reserved short
 
 	addQueue(reg, name)
-	
+
 	args := new(bytes.Buffer)
 	writeShortStr(args, name) // write q name
 	binary.Write(args, binary.BigEndian, uint32(0)) // message-count
 	binary.Write(args, binary.BigEndian, uint32(0)) // consumer-count
 
 	payload = methodPayload(classQueue, methodQueueDeclareOk, args.Bytes())
-	return name, writeFrame(conn, frameMethod, channel, payload)
+	return name, c.writeFrame(frameMethod, channel, payload)
 }
 
-func addMessageQueue(conn net.Conn, payload []byte) (string, error) {
+func addMessageQueue(c *connection, payload []byte) (string, error) {
 	// method header
 	_, off := readShortStr(payload, 6)
 	routingKey, _ := readShortStr(payload, off)
 
-	// payload header and body
-	_, _, _, err := readFrame(conn)
+	// payload header and body — read from our own socket (reads don't need the lock)
+	_, _, _, err := readFrame(c.conn)
 	if err != nil {
 		return "", err
 	}
-	_, _, body, err := readFrame(conn)
+	_, _, body, err := readFrame(c.conn)
 	if err != nil {
 		return "", err
 	}
