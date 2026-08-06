@@ -27,6 +27,10 @@ const (
 	methodChannelOpen   	= 10   // channel.open
 	methodChannelOpenOk 	= 11   // channel.open-ok
 
+	classExchange			= 40   // exchange class-id
+	methodExchangeDeclare	= 10   // exchange.declare
+	methodExchangeDeclareOk	= 11   // exchange.declare-ok
+
 	classQueue 				= 50   // queue class-id
 	methodQueueDeclare  	= 10   // queue.declare 
 	methodQueueDeclareOk 	= 11   // queue.declare-ok
@@ -50,6 +54,8 @@ const (
 
 // queue registry
 var reg = &registry{queues: make(map[string]*queue)}
+// exhange registry
+var exReg = &exchangeRegistry{exchanges: make(map[string]*exchange)}
 
 // The 8-byte header a client must send first: "AMQP" 0 0 9 1. (§4.2.2)
 var protocolHeader = []byte{'A', 'M', 'Q', 'P', 0, 0, 9, 1}
@@ -194,6 +200,12 @@ func handleConn(conn net.Conn) {
 			}
 			log.Printf("channel %d opened", ch)
 
+		case classID == classExchange && methodID == methodExchangeDeclare:
+			if err := handleExchangeDeclare(c, ch, payload); err != nil {
+				log.Printf("exchange.declare: %v", err)
+				return
+			}
+
 		case classID == classQueue && methodID == methodQueueDeclare:
 			q, err := sendQueueDeclareOk(c, ch, payload)
 			if err != nil {
@@ -201,6 +213,12 @@ func handleConn(conn net.Conn) {
 				return
 			}
 			log.Printf("queue %s opened", q)
+
+		case classID == classQueue && methodID == methodQueueBind:
+			if err := handleQueueBind(c, ch, payload); err != nil {
+				log.Printf("queue.bind: %v", err)
+				return
+			}
 
 		case classID == classBasic && methodID == methodBasicPublish:
 			q, err := addMessageQueue(c, payload)
@@ -304,6 +322,8 @@ func addMessageQueue(c *connection, payload []byte) (string, error) {
 		payload: body,
 		routingKey: routingKey,
 	}
-	addMessage(reg, routingKey, m)
+	if err := addMessage(reg, routingKey, m); err != nil {
+		return "", err
+	}
 	return routingKey, nil
 }

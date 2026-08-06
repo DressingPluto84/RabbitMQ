@@ -34,6 +34,28 @@ type registry struct {
 	queues map[string]*queue
 }
 
+type exchangeType int
+const ( direct exchangeType = iota; fanout; topic; headers )
+
+type binding struct {
+	qName string
+	routingKey string
+	matchAll bool
+	headers map[string]any
+}
+
+type exchange struct {
+	name string
+	typ exchangeType
+	bindings []binding
+	mu sync.Mutex
+}
+
+type exchangeRegistry struct {
+	mu        sync.RWMutex
+	exchanges map[string]*exchange
+}
+
 func addQueue(reg *registry, name string) *queue {
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
@@ -53,18 +75,19 @@ func addQueue(reg *registry, name string) *queue {
 	return q 
 }
 
-func addMessage(reg *registry, name string, m message) {
+func addMessage(reg *registry, name string, m message) error {
 	reg.mu.Lock()
 	q := reg.queues[name]
 	reg.mu.Unlock()
 	if q == nil {
-		return
+		return nil
 	}
 
 	q.mu.Lock()
-	defer q.mu.Unlock()
-
 	q.messages = append(q.messages, m)
+	q.mu.Unlock()
+
+	return drainMessages(q)
 }
 
 func (c *connection) writeFrame(frameType byte, channel uint16, payload []byte) error {

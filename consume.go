@@ -57,19 +57,36 @@ func handleBasicConsume(c *connection, ch uint16, payload []byte) error {
 
 	// Drain messages already in the queue to this consumer: pop under the lock,
 	// deliver outside it (deliver does socket I/O).
-	for {
-		q.mu.Lock()
-		if len(q.messages) == 0 {
+	if err := drainMessages(q); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func drainMessages(q *queue) error {
+	q.mu.Lock()
+	val := len(q.consumers)
+	q.mu.Unlock()
+
+	if val > 0 {
+		for {
+			q.mu.Lock()
+			if len(q.messages) == 0 {
+				q.mu.Unlock()
+				break
+			}
+
+			m := q.messages[0]
+			q.messages = q.messages[1:]
+			cons := q.consumers[q.next]
+			q.next = (q.next + 1) % len(q.consumers)
+
 			q.mu.Unlock()
-			break
-		}
 
-		m := q.messages[0]
-		q.messages = q.messages[1:]
-		q.mu.Unlock()
-
-		if err := deliverMessage(cons, m); err != nil {
-			return err
+			if err := deliverMessage(cons, m); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -103,6 +120,7 @@ func deliverMessage(cons consumer, m message) error {
 	args.WriteByte(0)                                         // redelivered = false
 	writeShortStr(args, "")                                   // exchange (default)
 	writeShortStr(args, m.routingKey)                         // routing-key
+
 	method := methodPayload(classBasic, methodBasicDeliver, args.Bytes())
 	if err := cons.c.writeFrame(frameMethod, cons.ch, method); err != nil {
 		return err
