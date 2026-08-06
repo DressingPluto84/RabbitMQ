@@ -1,4 +1,4 @@
-.PHONY: build run client test kill
+.PHONY: build run client test send receive kill
 
 # Build the broker binary.
 build:
@@ -12,6 +12,15 @@ run: build
 # (Start the broker with `make run` in another terminal first.)
 client:
 	cd test && go run .
+
+# Producer / consumer demo (broker must be running via `make run`).
+# Order matters in v1: `make send` first, then `make receive`.
+#   make send MSG="your message"
+send:
+	cd test && go run ./send $(MSG)
+
+receive:
+	cd test && go run ./receive
 
 # One-shot: build broker, run it in the background, run the client, then stop it.
 test: build
