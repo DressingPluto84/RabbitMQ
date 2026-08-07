@@ -47,6 +47,7 @@ const (
 	methodBasicConsumeOk	= 21   // basic.consume-ok
 	methodBasicPublish		= 40   // basic.publish
 	methodBasicDeliver		= 60   // basic.deliver
+	methodBasicAck			= 80   // basic.ack
 
 	channel_max 			= 0    // max num channels on a connection
 	frame_size 				= 4096 // max bytes between frames
@@ -84,8 +85,18 @@ func main() {
 func handleConn(conn net.Conn) {
 	c := &connection{
 		conn: conn,
+		unAck: make(map[keyAck]valueAck),
 	}
 	defer conn.Close()
+	defer func (){
+		removeConsumers(c) // drop this conn's consumers first, so requeues go to live ones
+		c.ackMu.Lock()
+		defer c.ackMu.Unlock()
+		for _, val := range c.unAck {
+			addMessage(reg, val.q.name, val.m)
+		}
+	}()
+
 	log.Printf("client connected: %s", conn.RemoteAddr())
 
 	// Step 1 — read + validate the protocol header (§4.2.2).
@@ -232,6 +243,12 @@ func handleConn(conn net.Conn) {
 
 		case classID == classBasic && methodID == methodBasicConsume:
 			if err := handleBasicConsume(c, ch, payload); err != nil {
+				log.Printf("basic.consume: %v", err)
+				return
+			}
+		
+		case classID == classBasic && methodID == methodBasicAck:
+			if err := handleBasicAck(c, ch, payload); err != nil {
 				log.Printf("basic.consume: %v", err)
 				return
 			}

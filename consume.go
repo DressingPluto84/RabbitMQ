@@ -18,12 +18,18 @@ var deliveryCounter atomic.Uint64
 //	reserved-1    short     (skip)
 //	queue         shortstr  -> which queue to subscribe to
 //	consumer-tag  shortstr  -> client's tag, or "" (we generate one)
-//	no-local, no-ack, exclusive, no-wait -> 4 bits (1 byte, ignore for v1)
+//	no-local, no-ack, exclusive, no-wait -> 4 bits
 //	arguments     table     (ignore)
 func handleBasicConsume(c *connection, ch uint16, payload []byte) error {
 	// Parse queue name and requested consumer-tag (offset 6 = past class/method/reserved).
 	queueName, off := readShortStr(payload, 6)
-	tag, _ := readShortStr(payload, off)
+	tag, off := readShortStr(payload, off)
+	opts := payload[off]
+
+	ack := false
+	if opts & 0x02 == 0 { // bit fields are numbered backwards so not 0x04
+		ack = true
+	}
 
 	// If the client didn't name its consumer, generate a tag.
 	if tag == "" {
@@ -43,6 +49,7 @@ func handleBasicConsume(c *connection, ch uint16, payload []byte) error {
 	cons := consumer{
 		tag: tag,
 		ch:  ch,
+		ack: ack,
 		c:   c,
 	}
 
@@ -62,6 +69,58 @@ func handleBasicConsume(c *connection, ch uint16, payload []byte) error {
 	}
 
 	return nil
+}
+
+func handleBasicAck(c *connection, ch uint16, payload []byte) error {
+	tag := binary.BigEndian.Uint64(payload[4:12]) // domain
+	multiple := payload[12] & 1 == 1
+
+	k := keyAck{
+		ch: ch,
+		tag: tag,
+	}
+
+	c.mu.Lock()
+	defer c.ackMu.Unlock()
+	delete(c.unAck, k)
+	if multiple {
+		for key := range c.unAck {
+			if key.ch == ch && key.tag <= tag {
+				delete(c.unAck, key)
+			}
+		}
+	}
+
+	return nil
+}
+
+// removeConsumers drops every consumer belonging to connection c from all
+// queues. Called on disconnect, before requeuing, so requeued messages only go
+// to still-alive consumers.
+func removeConsumers(c *connection) {
+	reg.mu.RLock()
+	queues := make([]*queue, 0, len(reg.queues))
+	for _, q := range reg.queues {
+		queues = append(queues, q)
+	}
+	reg.mu.RUnlock()
+
+	for _, q := range queues {
+		q.mu.Lock()
+		kept := q.consumers[:0]
+		for _, cons := range q.consumers {
+			if cons.c != c {
+				kept = append(kept, cons)
+			}
+		}
+		q.consumers = kept
+		if len(q.consumers) == 0 {
+			q.next = 0
+		} else {
+			q.next %= len(q.consumers)
+		}
+		q.mu.Unlock()
+	}
 }
 
 func drainMessages(q *queue) error {
@@ -84,7 +143,7 @@ func drainMessages(q *queue) error {
 
 			q.mu.Unlock()
 
-			if err := deliverMessage(cons, m); err != nil {
+			if err := deliverMessage(cons, m, q); err != nil {
 				return err
 			}
 		}
@@ -108,8 +167,23 @@ func sendBasicConsumeOk(c *connection, ch uint16, tag string) error {
 // run send.go/receive.go as two processes, a producer goroutine will write
 // these frames to a *different* consumer's socket, and you'll want a
 // per-connection write mutex around all three writes so they don't interleave.
-func deliverMessage(cons consumer, m message) error {
+func deliverMessage(cons consumer, m message, q *queue) error {
 	deliveryTag := deliveryCounter.Add(1)
+
+	if cons.ack {
+		key := keyAck{
+			ch: cons.ch,
+			tag: deliveryTag,
+		}
+		value := valueAck{
+			m: m,
+			q: q,
+		}
+
+		cons.c.ackMu.Lock()
+		cons.c.unAck[key] = value
+		cons.c.ackMu.Unlock()
+	}
 
 	// --- Frame 1: basic.deliver METHOD frame (60/60) ---
 	// Fields in order: consumer-tag(shortstr), delivery-tag(longlong=uint64),

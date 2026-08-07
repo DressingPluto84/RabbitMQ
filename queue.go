@@ -14,11 +14,24 @@ type message struct {
 type connection struct {
 	conn net.Conn
 	mu sync.Mutex
+	unAck map[keyAck]valueAck
+	ackMu sync.Mutex
+}
+
+type keyAck struct {
+	ch uint16
+	tag uint64
+}
+
+type valueAck struct {
+	m message
+	q *queue
 }
 
 type consumer struct {
 	tag string // tag into the channel in case of multi consumer
 	ch uint16
+	ack bool
 	c *connection
 }
 
