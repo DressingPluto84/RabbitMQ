@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"errors"
 )
 
 // Wire constants.
@@ -61,6 +62,7 @@ var exReg = &exchangeRegistry{exchanges: make(map[string]*exchange)}
 var protocolHeader = []byte{'A', 'M', 'Q', 'P', 0, 0, 9, 1}
 
 func main() {
+	addExchange("", direct)
 	ln, err := net.Listen("tcp", ":5672")
 	if err != nil {
 		log.Fatalf("listen: %v", err)
@@ -293,6 +295,7 @@ func sendQueueDeclareOk(c *connection, channel uint16, payload []byte) (string, 
 	name, _ := readShortStr(payload, 6) // 2 bytes each for class type and method, 2 bytes for reserved short
 
 	addQueue(reg, name)
+	addBinding("", binding{qName: name, routingKey: name})   // bind to default exchange
 
 	args := new(bytes.Buffer)
 	writeShortStr(args, name) // write q name
@@ -305,11 +308,11 @@ func sendQueueDeclareOk(c *connection, channel uint16, payload []byte) (string, 
 
 func addMessageQueue(c *connection, payload []byte) (string, error) {
 	// method header
-	_, off := readShortStr(payload, 6)
+	ex, off := readShortStr(payload, 6)
 	routingKey, _ := readShortStr(payload, off)
 
 	// payload header and body — read from our own socket (reads don't need the lock)
-	_, _, _, err := readFrame(c.conn)
+	_, _, headerPayload, err := readFrame(c.conn)
 	if err != nil {
 		return "", err
 	}
@@ -318,12 +321,31 @@ func addMessageQueue(c *connection, payload []byte) (string, error) {
 		return "", err
 	}
 
-	m := message{
-		payload: body,
-		routingKey: routingKey,
-	}
-	if err := addMessage(reg, routingKey, m); err != nil {
+	// the message's headers property (used only by headers exchanges)
+	msgHeaders, err := parseContentHeaders(headerPayload)
+	if err != nil {
 		return "", err
 	}
+
+	exReg.mu.RLock()
+	exc, ok := exReg.exchanges[ex]
+	exReg.mu.RUnlock()
+	if !ok {
+		return "", errors.New("Exchange does not exist")
+	}
+
+	m := message{
+		payload:    body,
+		routingKey: routingKey,
+		headers:    msgHeaders,
+	}
+	queues := exc.route(routingKey, m.headers)
+
+	for _, qName := range queues {
+		if err := addMessage(reg, qName, m); err != nil {
+			return "", err
+		}
+	}
+
 	return routingKey, nil
 }

@@ -6,8 +6,9 @@ import (
 )
 
 type message struct {
-	payload []byte
+	payload    []byte
 	routingKey string
+	headers    map[string]any // from the content header; used by headers exchanges
 }
 
 type connection struct {
@@ -93,5 +94,5 @@ func addMessage(reg *registry, name string, m message) error {
 func (c *connection) writeFrame(frameType byte, channel uint16, payload []byte) error {
     c.mu.Lock()
     defer c.mu.Unlock()
-    return writeFrame(c.conn, frameType, channel, payload) // unprotected until we added this func
+    return writeFrame(c.conn, frameType, channel, payload) // unprotected until we addeded this func
 }

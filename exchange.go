@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
+	"strings"
 )
 
 // parseExchangeType maps the wire type string to our enum.
@@ -63,6 +65,32 @@ func sendExchangeDeclareOk(c *connection, ch uint16) error {
 	return c.writeFrame(frameMethod, ch, payload)
 }
 
+// parseContentHeaders extracts the `headers` property from a content-header
+// frame payload (§4.2.6.1). Returns an empty map if none is present.
+//
+// Layout: class-id(2) weight(2) body-size(8) property-flags(2) property-list.
+// Basic-class properties come in a fixed order; `headers` is the 3rd, so if
+// content-type / content-encoding are present (bits 15/14) we skip them first.
+func parseContentHeaders(payload []byte) (map[string]any, error) {
+	if len(payload) < 14 {
+		return map[string]any{}, nil
+	}
+	flags := binary.BigEndian.Uint16(payload[12:14])
+	off := 14
+
+	if flags&0x8000 != 0 { // content-type (shortstr)
+		_, off = readShortStr(payload, off)
+	}
+	if flags&0x4000 != 0 { // content-encoding (shortstr)
+		_, off = readShortStr(payload, off)
+	}
+	if flags&0x2000 != 0 { // headers (table)
+		h, _, err := readTable(payload, off)
+		return h, err
+	}
+	return map[string]any{}, nil
+}
+
 // addBinding appends a binding to an exchange (under the exchange's lock).
 func addBinding(exchangeName string, b binding) error {
 	exReg.mu.RLock()
@@ -90,16 +118,26 @@ func addBinding(exchangeName string, b binding) error {
 func handleQueueBind(c *connection, ch uint16, payload []byte) error {
 	queueName, off := readShortStr(payload, 6)
 	exchangeName, off := readShortStr(payload, off)
-	routingKey, _ := readShortStr(payload, off)
+	routingKey, off := readShortStr(payload, off)
+	off++ // no-wait bit (1 packed byte)
 
-	// TODO (headers exchange): parse the `arguments` table for x-match + header
-	// pairs and fill b.matchAll / b.headers. For now bindings carry the routing
-	// key/pattern, which covers direct/fanout/topic.
-	b := binding{qName: queueName, routingKey: routingKey}
+	// arguments table — for a headers binding it carries "x-match" (all/any) and
+	// the header pairs to match. Empty for direct/fanout/topic.
+	args, _, err := readTable(payload, off)
+	if err != nil {
+		return err
+	}
+	matchAll := false
+	if xm, ok := args["x-match"].(string); ok {
+		matchAll = xm == "all"
+	}
+	delete(args, "x-match") // x-match is control, not a header to match on
+
+	b := binding{qName: queueName, routingKey: routingKey, matchAll: matchAll, headers: args}
 	if err := addBinding(exchangeName, b); err != nil {
 		return err
 	}
-	log.Printf("bound queue %q to exchange %q with key %q", queueName, exchangeName, routingKey)
+	log.Printf("bound queue %q to exchange %q (key %q, headers %v)", queueName, exchangeName, routingKey, args)
 
 	return sendQueueBindOk(c, ch)
 }
@@ -108,4 +146,87 @@ func handleQueueBind(c *connection, ch uint16, payload []byte) error {
 func sendQueueBindOk(c *connection, ch uint16) error {
 	payload := methodPayload(classQueue, methodQueueBindOk, nil)
 	return c.writeFrame(frameMethod, ch, payload)
+}
+
+func (ex *exchange) route(routingKey string, msgHeaders map[string]any) []string {
+	ex.mu.Lock()
+	defer ex.mu.Unlock()
+	var res []string
+	switch ex.typ {
+	case direct:
+		for _, bind := range ex.bindings {
+			if bind.routingKey == routingKey {
+				res = append(res, bind.qName)
+			}
+		}
+	case fanout:
+		for _, bind := range ex.bindings {
+			res = append(res, bind.qName)
+		}
+	case topic:
+		s := strings.Split(routingKey, ".")
+		for _, bind := range ex.bindings {
+			p := strings.Split(bind.routingKey, ".")
+			if topicDP(s, p) {
+				res = append(res, bind.qName)
+			}
+		}
+	case headers:
+		for _, bind := range ex.bindings {
+			if bind.matchAll && allMatch(bind.headers, msgHeaders) {
+				res = append(res, bind.qName)
+			} else if !bind.matchAll && partialMatch(bind.headers, msgHeaders) {
+				res = append(res, bind.qName)
+			}
+		}
+	}
+
+	return res
+}
+
+func topicDP(s []string, p []string) bool {
+	dp := make([][]bool, len(s)+1)
+	for i := range dp { dp[i] = make([]bool, len(p)+1) }
+	dp[len(s)][len(p)] = true
+
+	// checks for # to see if there is nothing after it, as if we reach this pint without
+	// the loop then we check out of bounds for the string and get False since we did not
+	// check if trailing # matches with empty string which it should
+	for j := len(p)-1; j >= 0; j -= 1 {
+		if p[j] == "#" {
+			dp[len(s)][j] = dp[len(s)][j+1]
+		}
+	}
+
+	for i := len(s) - 1; i > -1; i -= 1 {
+		for j := len(p) - 1; j > -1; j -= 1 {
+			if s[i] == p[j] || p[j] == "*" {
+				dp[i][j] = dp[i + 1][j + 1]
+			} else if p[j] == "#" {
+				dp[i][j] = dp[i + 1][j] || dp[i][j + 1]
+			}
+		}
+	}
+
+	return dp[0][0]
+}
+
+func partialMatch(m1 map[string]any, m2 map[string]any) bool {
+	for k, v := range m1 {
+		if val, ok := m2[k]; ok && val == v {
+			return true
+		}
+	}
+
+	return false
+}
+
+func allMatch(m1 map[string]any, m2 map[string]any) bool {
+	for k, v := range m1 {
+		if val, ok := m2[k]; !ok || val != v {
+			return false
+		}
+	}
+
+	return true
 }

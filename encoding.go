@@ -28,6 +28,57 @@ func writeLongStr(buf *bytes.Buffer, s string) {
 	buf.WriteString(s)
 }
 
+// readTable decodes a field-table (§4.2.5.5): a 4-byte byte-length, then that
+// many bytes of packed name→value pairs. Returns the map and the offset just
+// past the whole table.
+func readTable(frame []byte, offset int) (map[string]any, int, error) {
+	size := int(binary.BigEndian.Uint32(frame[offset : offset+4]))
+	offset += 4
+	end := offset + size
+
+	table := make(map[string]any)
+	for offset < end {
+		var name string
+		name, offset = readShortStr(frame, offset)
+
+		val, next, err := readFieldValue(frame, offset)
+		if err != nil {
+			return nil, 0, err
+		}
+		table[name] = val
+		offset = next
+	}
+	return table, end, nil
+}
+
+// readFieldValue decodes one typed field value: a 1-byte type tag followed by
+// the value. Handles the types amqp091-go commonly emits; errors on the rest.
+func readFieldValue(frame []byte, offset int) (any, int, error) {
+	typ := frame[offset]
+	offset++
+	switch typ {
+	case 'S': // long string
+		size := int(binary.BigEndian.Uint32(frame[offset : offset+4]))
+		offset += 4
+		return string(frame[offset : offset+size]), offset + size, nil
+	case 't': // boolean
+		return frame[offset] != 0, offset + 1, nil
+	case 'b': // signed 8-bit
+		return int8(frame[offset]), offset + 1, nil
+	case 'I': // signed 32-bit
+		return int32(binary.BigEndian.Uint32(frame[offset : offset+4])), offset + 4, nil
+	case 'l': // signed 64-bit
+		return int64(binary.BigEndian.Uint64(frame[offset : offset+8])), offset + 8, nil
+	case 'F': // nested table
+		t, next, err := readTable(frame, offset)
+		return t, next, err
+	case 'V': // void / no value
+		return nil, offset, nil
+	default:
+		return nil, 0, fmt.Errorf("unsupported field-value type %q", typ)
+	}
+}
+
 // writeEmptyTable: a field-table with no entries is just a zero length. (§4.2.5.5)
 func writeEmptyTable(buf *bytes.Buffer) {
 	binary.Write(buf, binary.BigEndian, uint32(0))
