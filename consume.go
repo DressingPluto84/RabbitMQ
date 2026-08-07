@@ -71,7 +71,7 @@ func handleBasicConsume(c *connection, ch uint16, payload []byte) error {
 	return nil
 }
 
-func handleBasicAck(c *connection, ch uint16, payload []byte) error {
+func handleBasicAck(c *connection, ch uint16, payload []byte, reg *registry) error {
 	tag := binary.BigEndian.Uint64(payload[4:12]) // domain
 	multiple := payload[12] & 1 == 1
 
@@ -80,8 +80,7 @@ func handleBasicAck(c *connection, ch uint16, payload []byte) error {
 		tag: tag,
 	}
 
-	c.mu.Lock()
-	defer c.ackMu.Unlock()
+	c.ackMu.Lock()
 	delete(c.unAck, k)
 	if multiple {
 		for key := range c.unAck {
@@ -90,7 +89,9 @@ func handleBasicAck(c *connection, ch uint16, payload []byte) error {
 			}
 		}
 	}
+	c.ackMu.Unlock()
 
+	drainAll(reg)
 	return nil
 }
 
@@ -123,10 +124,50 @@ func removeConsumers(c *connection) {
 	}
 }
 
+// handleBasicQos parses basic.qos (60/10) and stores the prefetch-count for
+// this channel. Fields: prefetch-size(long, ignored), prefetch-count(short),
+// global(bit, ignored — we track per channel).
+func handleBasicQos(c *connection, ch uint16, payload []byte) error {
+	prefetchCount := binary.BigEndian.Uint16(payload[8:10]) // past class/method(4) + prefetch-size(4)
+
+	c.ackMu.Lock()
+	c.prefetch[ch] = prefetchCount
+	c.ackMu.Unlock()
+
+	return sendBasicQosOk(c, ch)
+}
+
+// sendBasicQosOk replies to basic.qos. It has no fields.
+func sendBasicQosOk(c *connection, ch uint16) error {
+	payload := methodPayload(classBasic, methodBasicQosOk, nil)
+	return c.writeFrame(frameMethod, ch, payload)
+}
+
+// atPrefetchLimit reports whether the given channel has hit its prefetch cap
+// (unacked count on that channel >= the limit). Limit 0 means unlimited.
+// Caller must NOT hold ackMu.
+func (c *connection) atPrefetchLimit(ch uint16) bool {
+	c.ackMu.Lock()
+	defer c.ackMu.Unlock()
+
+	limit := c.prefetch[ch]
+	if limit == 0 {
+		return false // unlimited
+	}
+	var count uint16
+	for k := range c.unAck {
+		if k.ch == ch {
+			count++
+		}
+	}
+	return count >= limit
+}
+
 func drainMessages(q *queue) error {
 	q.mu.Lock()
 	val := len(q.consumers)
 	q.mu.Unlock()
+	cnt := 0
 
 	if val > 0 {
 		for {
@@ -136,10 +177,22 @@ func drainMessages(q *queue) error {
 				break
 			}
 
-			m := q.messages[0]
-			q.messages = q.messages[1:]
 			cons := q.consumers[q.next]
 			q.next = (q.next + 1) % len(q.consumers)
+
+			if cons.c.atPrefetchLimit(cons.ch) {
+				cnt += 1
+				if cnt == len(q.consumers) {
+					q.mu.Unlock()
+					break
+				}
+				q.mu.Unlock()
+				continue
+			}
+
+			m := q.messages[0]
+			q.messages = q.messages[1:]
+			cnt = 0
 
 			q.mu.Unlock()
 
@@ -150,6 +203,20 @@ func drainMessages(q *queue) error {
 	}
 
 	return nil
+}
+
+func drainAll(reg *registry) {
+	queues := make([]*queue, 0, len(reg.queues))
+
+	reg.mu.RLock()
+	for _, q := range reg.queues {
+		queues = append(queues, q)
+	}
+	reg.mu.RUnlock()
+
+	for _, q := range queues {
+		drainMessages(q)
+	}
 }
 
 // sendBasicConsumeOk replies to basic.consume. One field: consumer-tag (shortstr).

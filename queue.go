@@ -15,7 +15,8 @@ type connection struct {
 	conn net.Conn
 	mu sync.Mutex
 	unAck map[keyAck]valueAck
-	ackMu sync.Mutex
+	prefetch map[uint16]uint16 // channel -> prefetch limit (0 = unlimited)
+	ackMu sync.Mutex           // guards both unAck and prefetch
 }
 
 type keyAck struct {

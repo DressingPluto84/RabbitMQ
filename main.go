@@ -43,6 +43,8 @@ const (
 	methodQueueDeleteOk		= 41   // queue.delete.ok
 
 	classBasic				= 60   // basic class-id
+	methodBasicQos			= 10   // basic.qos
+	methodBasicQosOk		= 11   // basic.qos-ok
 	methodBasicConsume		= 20   // basic.consume
 	methodBasicConsumeOk	= 21   // basic.consume-ok
 	methodBasicPublish		= 40   // basic.publish
@@ -86,6 +88,7 @@ func handleConn(conn net.Conn) {
 	c := &connection{
 		conn: conn,
 		unAck: make(map[keyAck]valueAck),
+		prefetch: make(map[uint16]uint16),
 	}
 	defer conn.Close()
 	defer func (){
@@ -247,9 +250,15 @@ func handleConn(conn net.Conn) {
 				return
 			}
 		
+		case classID == classBasic && methodID == methodBasicQos:
+			if err := handleBasicQos(c, ch, payload); err != nil {
+				log.Printf("basic.qos: %v", err)
+				return
+			}
+
 		case classID == classBasic && methodID == methodBasicAck:
-			if err := handleBasicAck(c, ch, payload); err != nil {
-				log.Printf("basic.consume: %v", err)
+			if err := handleBasicAck(c, ch, payload, reg); err != nil {
+				log.Printf("basic.ack: %v", err)
 				return
 			}
 
